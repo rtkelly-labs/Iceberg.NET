@@ -13,8 +13,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [0.0.1-alpha.1] - 2026-10-25
 
 The first published build: an early alpha of `Iceberg.Net.Core`, `Avro`, `Puffin`, `IO`, `Catalog`, `Data` and `Linq`,
-ahead of the first preview, `0.1.0-preview.1`. It proves the release path, nuget.org trusted publishing from
-`rtkelly-labs`, rather than a supported API. `EntityFrameworkCore`, `Spark`, `Athena` and `Arrow` follow in a later
+ahead of the first preview, `0.1.0-preview.1`. It exercises the release path and nuget.org trusted publishing from
+`rtkelly-labs`; it is not a supported API release. `EntityFrameworkCore`, `Spark`, `Athena` and `Arrow` follow in a later
 preview. The REST catalog server is not published until its storage-location checks land.
 
 ### Added
