@@ -1,0 +1,306 @@
+# DuckLake (`Iceberg.Net.DuckLake`)
+
+A C# implementation of the [DuckLake](https://ducklake.select/docs/stable/specification/introduction) table
+format (1.0 and 1.1), built inside this repository on the Iceberg data plane and held to the same rules as the Iceberg code.
+
+**Status:** evaluation build-out. It reads and writes lakes that DuckDB's `ducklake` extension (the reference
+implementation) reads and writes, verified in both directions by cross-engine tests. Not packed or published
+(`IsPackable=false`); the API is not settled. The catalog layer is EF Core on SQLite and PostgreSQL, both tested
+against DuckDB, and both format versions are read and written.
+
+## Why DuckLake fits here
+
+DuckLake keeps table metadata in ordinary SQL tables (28 of them, in any database with transactions and primary
+keys) instead of Iceberg's JSON + Avro manifest tree, but its data plane is the same: Parquet files whose
+`field_id`s are the columns' IDs (DuckLake `column_id`), positional delete files, min/max statistics per file and
+column. So a DuckLake table maps onto an Iceberg `Schema`, and everything below the metadata layer is reused as is.
+
+| Reused from Iceberg.NET, unchanged | Replaced for DuckLake |
+|---|---|
+| `ParquetFiles`: field-ID writer and reader, nested columns (Dremel), ranged reads, row-group pruning | Metadata JSON, manifests, manifest lists, the Avro codec |
+| The type model and physical values (`IcebergType`, `IcebergDecimal`, `IcebergTime`) | The metastore commit protocol (DuckLake commits are one SQL transaction) |
+| `Binder`, `MetricsEvaluator`, `RowEvaluator` (pruning and exact residual filtering) | Catalogs (the SQL database *is* the catalog) |
+| `IFileIO` (local, S3), write-once files | Puffin (DuckLake's deletion vectors are experimental and not read) |
+| The `Corruption` contract, `[Spec]` traceability, the fuzz harness, the oracle-test pattern | |
+
+About 3,400 lines of library code. No existing library changed; the shared pieces that did are listed under
+[Tests](#tests).
+
+## Evaluation of Iceberg.NET as the base
+
+What made this quick, and what got in the way, for whoever takes either format further.
+
+- **The data plane is genuinely format-neutral.** `ParquetFiles.WriteAsync/ReadBatchesAsync` take a `Schema`, write
+  field IDs on every node and resolve by field ID on read; DuckDB reads its files, nested types included, with no
+  changes. Row-group pruning, ranged reads and missing-column defaults (`initial-default`) came for free.
+- **The expression stack composes.** `MetricsEvaluator.MightMatch(recordCount, statsOf)` takes typed statistics from
+  any source, so DuckLake's string statistics prune files after one parse step; `RowEvaluator` gives exact filters.
+- **The rules transfer.** "Resolve by field ID", "files are never overwritten", "nothing is deleted after an unknown
+  commit", "decoders of untrusted input are guarded and fuzzed" and "behaviour other engines observe needs a
+  cross-engine test" all apply to DuckLake unchanged (see [the same constraints](#the-same-constraints)).
+- **Friction found:**
+  - The positional-delete reader (`PositionDeleteFiles`) hard-codes Iceberg's reserved field IDs; DuckDB writes
+    different ones, so DuckLake has its own small reader that accepts both.
+  - `ParquetFiles.WriteAsync` does not report the footer length, which DuckLake records (`footer_size`); it costs one
+    8-byte ranged read per file. Returning it from the writer would remove that.
+  - `int8`/`int16` are written as plain `INT32` (Iceberg has no narrower ints). DuckDB reads them correctly, but the
+    files lose the `INT(8)`/`INT(16)` annotation DuckDB itself writes.
+  - Rows are `object?[]` of *physical* values (days, microseconds, unscaled decimals). Correct and fast, but a C#
+    caller converts by hand; `DuckLakeValues.Normalize` accepts CLR types on the way in, nothing converts on the way
+    out. The LINQ layer's mapping (`docs/linq.md`) is the natural next step for both formats.
+  - SharpFuzz-instrumented code must not run before `Fuzzer.LibFuzzer.Run` maps its coverage memory, so the fuzz
+    harness builds its DuckLake type lazily (like its Iceberg metadata). An eager static field crashed every target
+    at start-up with an access violation.
+
+## Is this a good idea, and where should it live?
+
+**Recommendation: yes, as an incubation project in this repository, behind clear graduation criteria.**
+
+For:
+- **Same job as Iceberg.NET.** It lets a C# producer commit to a lakehouse without handing the write to Spark or
+  Python. DuckLake does that with one SQL transaction on a database the team already runs (PostgreSQL). There is no
+  metadata-file tree, and no REST or Glue catalog to operate.
+- **Cheap here.** Almost all of the hard part (Parquet with field IDs, nested columns, pruning, storage, the
+  oracle-test setup) is shared. Reaching read/write parity with DuckDB, on two catalog databases and two format versions, took about 3,400 lines.
+- **Momentum.** DuckLake 1.0 shipped in April 2026 and 1.1 in October 2026. DuckDB reports over 1.5 million downloads
+  a week for the extension.
+- **Multi-table transactions** are native, which Iceberg only gets through REST catalogs that support them.
+
+Against:
+- **Few readers.** In practice only DuckDB (and services built on it) reads DuckLake. Athena, Glue, Spark, Trino
+  and Snowflake read Iceberg. A table written here as DuckLake is invisible to an AWS Athena/Glue estate. So it suits
+  DuckDB-centred analytics, not tables that platform consumers query through Athena.
+- **The reference implementation is the spec.** DuckDB Labs owns the format, and some behaviour is defined only by
+  DuckDB (see the differences table below; 1.1 has since written several of those rules down). Releases come about
+  every six months, each with a catalog migration. Keeping up is a standing cost.
+- **The catalog database becomes production infrastructure.** Every read plans from it, and every commit is a
+  transaction on it.
+
+Why incubate here rather than in its own repository: the data plane is shared, and the oracle and traceability
+tooling apply unchanged. A separate repository would have to copy or package `Iceberg.Net.Data` first. Rules while
+incubating: no Iceberg project depends on DuckLake (one direction only), `IsPackable=false`, and DuckLake tests sit
+in the `cross-engine` CI suite. Graduation criteria: CI green with the DuckDB oracle (1.0 and 1.1; done), a tested PostgreSQL
+catalog (done), the current spec version supported (done), an API review, and a named consumer. At graduation, move the format-neutral
+Parquet layer out of `Iceberg.Net.Data`, so DuckLake no longer pulls in Avro, Puffin and the Iceberg catalogs.
+
+## Catalog databases
+
+DuckLake's catalog is "any database with transactions and primary keys". What matters in practice is which
+databases DuckDB can attach, because a lake that DuckDB cannot open has lost the format's only reader:
+
+| Catalog | DuckDB | Use | From C# |
+|---|---|---|---|
+| PostgreSQL (12+) | `ATTACH 'ducklake:postgres:dbname=… host=…'` | Multi-user lakehouse with remote clients: the production choice | `DuckLakeStore.PostgreSql` (Npgsql EF Core), tested |
+| SQLite file | `ATTACH 'ducklake:sqlite:metadata.sqlite'` | Several local processes, one writer at a time | `DuckLakeStore.Sqlite` (Microsoft.Data.Sqlite EF Core), tested |
+| DuckDB file | `ATTACH 'ducklake:metadata.ducklake'` | One process | Only through DuckDB.NET; no maintained EF Core provider |
+| Quack (experimental) | A DuckDB catalog served over the network | Several clients on a DuckDB catalog | No .NET client |
+
+SQL Server, MySQL and others would work from C# but not from DuckDB, so they are out of scope.
+
+What DuckDB creates in PostgreSQL (observed with DuckDB 1.5.5 and PostgreSQL 16; DuckLake 1.0):
+- **Native types.** `boolean`, `uuid` and `timestamp with time zone` (SQLite gets `BIGINT` 0/1 and `VARCHAR`).
+- **29 tables.** The 28 catalog tables, plus one inlined-data table per table and schema version.
+- **Primary keys on 5 tables only:** `ducklake_snapshot`, `ducklake_snapshot_changes`, `ducklake_schema`,
+  `ducklake_data_file` and `ducklake_delete_file`. Every other table has none.
+- **Inlined values.** `VARCHAR` values are stored as `bytea`, as the spec's PostgreSQL inlining table says. Nested
+  values and timestamps are stored as text.
+
+So the catalog layer needs, per database: the column types DuckDB uses, the encodings of inlined values, a way to
+check whether a table exists, and how it reports a unique-key violation. `DuckLakeDialect` holds these for SQLite
+and PostgreSQL; `SpecSchemaTests` checks the DDL against the spec's script, and the cross-engine tests have DuckDB open the result.
+
+## EF Core as the catalog layer
+
+The catalog layer is EF Core 10 (`DuckLakeStore`, `DuckLakeDbContext`): the SQLite and PostgreSQL providers handle
+connections, type mapping and transactions. Snapshot visibility (`s >= begin_snapshot && (end_snapshot == null || s < end_snapshot)`)
+is one reusable LINQ filter (`VersionedQueries.LiveAt`), and `ExecuteUpdateAsync` does the set-based `end_snapshot`
+updates. The repository already used EF Core 10 (`Iceberg.Net.EntityFrameworkCore`), so the team knows it.
+
+**How it stays compatible with DuckDB:**
+1. **No EF migrations or `EnsureCreated`.** The schema belongs to the spec and to DuckDB, which migrates it (1.0 → 1.1
+   adds columns, a table, and renames inlined columns). `CreateAsync` runs the spec's script in DuckDB's column types
+   for the database (`DuckLakeDialect.Ddl`); EF only queries and writes. No `__EFMigrationsHistory` is created.
+2. **Column types match DuckDB's per provider.** On SQLite, value converters (bool ↔ `BIGINT`, Guid ↔ `VARCHAR`,
+   `DateTimeOffset` ↔ DuckDB's text form); on PostgreSQL the native mappings already match.
+3. **Keys exist in the EF model only.** Most tables have no primary key, and EF can't insert into a keyless entity, so
+   the model declares composite keys (e.g. `(table_id, column_id, begin_snapshot)` for `ducklake_column`) that are
+   never created in the database.
+4. **No long-lived change tracking.** Reads are `AsNoTracking`. A commit is one explicit transaction of inserts
+   (`SaveChanges` per operation, then the tracker is cleared) and `ExecuteUpdate`. A lost snapshot-ID race shows up
+   as `DbUpdateException` and goes to the conflict check.
+5. **Raw SQL for the dynamic tables.** `ducklake_inlined_data_{table}_{version}` and `ducklake_inlined_delete_{table}`
+   have names and columns that vary per table; they are read through the context's connection and transaction, with
+   quoted identifiers and the per-provider encodings in the dialect.
+6. **A model per spec version.** 1.1 adds columns that 1.0 catalogs don't have, so the model is cached per
+   (database, version) and chosen from `ducklake_metadata.version` at open time.
+
+A DuckDB-file catalog stays out of reach: there is no maintained EF Core provider for DuckDB.
+
+## DuckLake 1.1
+
+DuckLake 1.1 shipped on 21 October 2026 with DuckDB 2.0. Both versions are supported side by side, chosen by
+`ducklake_metadata.version` when a catalog is opened; new catalogs are 1.1 unless `CreateAsync` is given
+`DuckLakeCatalog.FormatVersion10`. A catalog is never migrated here (DuckDB does that). The spec pages pinned in
+`docs/spec/ducklake-sections.json` are `docs/stable` (1.1).
+
+| 1.1 change | Here |
+|---|---|
+| `ducklake_schema.parent_schema_id` (nested schemas, e.g. `sales.europe.orders`) | Schemas are looked up by path; `CreateSchemaAsync("sales.europe")` creates a child; `changes_made` quotes each part (`"sales"."europe"`) |
+| `row_group_count` on data and delete files | Written |
+| `min_is_exact` / `max_is_exact` on file and table statistics | Written `true` where there is a bound (bounds come from the rows, untruncated), NULL where there is none |
+| `ducklake_view_column_tag` table | Created; views are not implemented |
+| Inlined tables' `row_id`/`begin_snapshot`/`end_snapshot` renamed `_ducklake_…` | Read by catalog version |
+| `null` column type, promotable later | `DuckLakeType.Null`; columns are left out of data files and read as NULL; `AlterColumnTypeAsync` promotes them |
+| Partition transforms `epoch_year`/`epoch_month`/`epoch_day`/`epoch_hour` | Iceberg.NET's time transforms (1.1 catalogs only) |
+| Multi-snapshot Puffin delete files | Not read (Puffin deletion vectors are not implemented) |
+| Partial files and the path chain, now in the spec's Queries page | Already implemented from DuckDB's behaviour |
+
+The 1.1 reference is DuckDB 2.0's `ducklake` extension. PyPI has no wheel for it (the newest extension wheel is 1.5.5,
+which writes 1.0), so its oracle downloads it from extensions.duckdb.org. The `cross-engine` CI job installs DuckDB 2.0
+and requires it (`ICEBERG_DUCKLAKE11_REQUIRED=1`); every 1.1 case passes there. This sandbox cannot reach that host,
+so locally the 1.1 oracle cases skip. The 1.0 oracle (DuckDB 1.5.5) runs everywhere.
+
+## Usage
+
+```csharp
+using Iceberg.Net.DuckLake;
+using Iceberg.Net.Expressions;
+using Iceberg.Net.IO;
+
+var store = DuckLakeStore.Sqlite("Data Source=lake/catalog.sqlite");          // or DuckLakeStore.PostgreSql("Host=…")
+var lake = await DuckLakeCatalog.CreateAsync(store, new LocalFileIO(), "lake/data/");   // or OpenAsync(store, io)
+
+await using (var tx = lake.BeginTransaction(author: "etl", commitMessage: "load"))
+{
+    await tx.CreateTableAsync("main", "events",
+        [new("id", DuckLakeType.Int64, Nullable: false), new("tags", DuckLakeType.List(DuckLakeType.Varchar))]);
+    await tx.InsertAsync("main", "events", [[1L, new[] { "a" }], [2L, null]]);
+    await tx.CommitAsync();                       // one snapshot
+}
+await using (var tx = lake.BeginTransaction())
+{
+    await tx.DeleteAsync("main", "events", Expr.Equal("id", 2L));
+    await tx.CommitAsync();
+}
+var table = await lake.LoadTableAsync("main", "events");                 // latest, or snapshotId: n
+var rows = await lake.ReadAsync(table, Expr.GreaterThan("id", 0L));      // pruned by file statistics, filtered exactly
+await DuckLakeValidator.AssertValidAsync(lake);                         // the catalog's invariants hold
+```
+
+DuckDB opens the same lake with `ATTACH '<store.DuckDbAttach()>' AS lake` (`ducklake:sqlite:lake/catalog.sqlite` or
+`ducklake:postgres:dbname=… host=…`). A longer walk-through (nested types, partitioning, UPDATE, schema evolution,
+time travel) is `examples/DuckLake.Quickstart`:
+
+```bash
+dotnet run --project examples/DuckLake.Quickstart [directory] [postgres connection string]
+```
+
+## Layout
+
+| File | What |
+|---|---|
+| `DuckLakeStore.cs` | The catalog database (`DuckLakeStore.Sqlite` / `PostgreSql`), the EF Core context and the entities for the fixed tables |
+| `DuckLakeSql.cs` | `DuckLakeDialect`: the spec's DDL per database and format version, DuckDB's storage of BOOLEAN/UUID/TIMESTAMPTZ, raw-SQL helpers |
+| `DuckLakeCatalog.cs` | Create/open, snapshots, schema and table lookup at a snapshot, scan planning (statistics pruning), reads |
+| `DuckLakeTransaction.cs` | Staged DDL and data operations, and the commit: ID assignment, conflict check, catalog rows |
+| `DuckLakeChanges.cs` | `changes_made` parsing and formatting, and the spec's logical-conflict rules |
+| `DuckLakeTypes.cs` | DuckLake types and columns, `ducklake_column` trees, the mapping to Iceberg fields |
+| `DuckLakeValues.cs` | Value normalisation, statistics text encoding (spec "Type Encoding for Statistics"), statistics collection |
+| `DuckLakeDeleteFiles.cs` | Parquet delete files; DuckDB's inlined data and deletion tables |
+| `DuckLakeNestedText.cs` | DuckDB's text form of nested inlined values |
+| `DuckLakePartitioning.cs` | Partitioned writes (`identity`, `year`/`month`/`day`/`hour`, 1.1's `epoch_*`, `bucket(N)`) |
+| `DuckLakeValidator.cs` | Whole-lake consistency check: snapshot and ID counters, versioned ranges, delete files, row IDs, files in storage |
+
+## What works
+
+| Area | State |
+|---|---|
+| Catalog | Creates the catalog (matching DuckDB's schema for SQLite and PostgreSQL exactly, per format version) with snapshot 0 and schema `main`, or opens an existing 1.0 or 1.1 catalog. EF Core over SQLite or PostgreSQL |
+| Reads | Snapshot-scoped catalog queries (spec "Queries"), relative/absolute path chains, nested schemas (1.1), delete files, inlined rows (primitive and nested), inlined deletions, DuckDB's partial (merged/flushed) data and delete files with per-row snapshots, row IDs, time travel by snapshot or timestamp |
+| Pruning | File statistics through the Iceberg metrics evaluator; Parquet row groups through footer statistics; exact residual filter |
+| Writes | CREATE/DROP SCHEMA (nested in 1.1), CREATE/DROP TABLE, INSERT (file, file and table statistics, row IDs), DELETE (merge-on-read; a replacement delete file per data file, emptied files removed), UPDATE (delete + insert, new row IDs), ADD/DROP/RENAME COLUMN, type widening (and `null` promotion), partitioned inserts, author/message/extra info |
+| Types | `boolean`, `int8`–`int64`, `float32/64`, `decimal(p,s)`, `date`, `time`, `timestamp`, `timestamptz`, `timestamp_ns`, `varchar`, `json`, `blob`, `uuid`, `list`, `struct`, `map`, and 1.1's `null` |
+| Concurrency | Optimistic commits: on a lost race for the snapshot ID, the `changes_made` of every snapshot since the base are checked against the spec's logical conflicts, then the metadata is retried without rewriting files; delete-vs-delete is decided per data file. Tested with concurrent writers on both databases, and with DuckDB writing in between |
+| Validation | `DuckLakeValidator` checks a whole lake (any writer's) and reports problems; `Deep` also reads every live file |
+
+## The same constraints
+
+| Iceberg.NET rule (AGENTS.md) | For DuckLake |
+|---|---|
+| The spec wins; tests are tagged with the section they verify | `[Spec("ducklake: INSERT")]` links to sections of the DuckLake spec pinned in `docs/spec/ducklake-sections.json`; `spec_trace.py matrix --check` fails on unknown links, `drift --ducklake` reports upstream changes. All 49 implementable sections (1.1) have tests. Where DuckDB and the spec text disagree, the difference is listed below rather than silently followed |
+| Resolve by field ID, never by name or position | Data files by `column_id` = `field_id`; delete files by their field IDs; inlined tables by the column IDs of the schema version they were created for |
+| Metadata files are never overwritten; nothing written for an unknown commit is deleted | Data and delete files are written once (`overwrite: false`) with UUIDv7 names; files are deleted only when the commit is known not to have happened (conflict, error before COMMIT, abandoned transaction); a failure *during* COMMIT throws `DuckLakeCommitStateUnknownException` and keeps them |
+| New behaviour other engines can observe needs a cross-engine test | `CrossEngineTests` (each case on SQLite and PostgreSQL, 1.0 and 1.1) and the BDD `CrossEngine.feature`: DuckDB reads every type, delete, update, schema change and partition written here and agrees with time travel at every snapshot; this library reads DuckDB's inlined rows, inlined deletions, flushed and merged partial files, and partitioned tables; the two engines write to one lake in turn and conflict correctly |
+| Decoders of untrusted input follow the `Corruption` contract | Catalog rows are untrusted: `changes_made`, column trees, statistics, timestamps and inlined nested text fail with format errors (tested in `CatalogTests`/`EncodingTests`), nesting is bounded, and `tools/fuzz.sh` has `ducklake-changes` and `ducklake-inlined` targets (in the weekly `fuzz` workflow; about 500,000 runs each without a finding so far) plus an always-on mutation test |
+| Fixtures are other engines' outputs, never hand-edited | No committed fixtures: the oracle generates DuckDB's lakes at test time |
+| A BDD specification for user-visible behaviour | `Iceberg.Net.DuckLake.Behaviour.Tests`: Gherkin features for tables, deletes, schema evolution, partitioning, concurrency, format versions and DuckDB interop; every scenario ends with a deep validation |
+| Property tests against a model | `ModelBasedTests`: random operation sequences against an in-memory model, shrinking to a minimal failing sequence with a replay seed |
+| Warnings are errors | Unchanged (`Directory.Build.props`) |
+
+## Where the reference implementation and the spec differ
+
+DuckLake is a less formal specification than Iceberg's; several behaviours are defined only by DuckDB. Each item
+below was observed with DuckDB 1.5.5 (`ducklake` extension `d8a1881e`) and is what this library does.
+
+| Topic | Spec text | DuckDB | Here |
+|---|---|---|---|
+| `value_count` in file statistics | "number of values (including NULL and NaN values)" (Queries, INSERT) | Non-null values only | Write DuckDB's meaning; read either safely (an over-count only ever disables pruning) |
+| Delete file layout | "the row ids of rows that are deleted" | Iceberg positional layout `(file_path, pos)`, `pos` = row position in the data file, field IDs 2147483646/2147483645 (not Iceberg's 2147483546/2147483545) | Write DuckDB's layout and IDs; read both ID pairs |
+| `ducklake_snapshot` timestamp column | `snapshot_timestamp` in the Queries page's INSERT | `snapshot_time` (as the table page says) | `snapshot_time` |
+| `file_order` | "needs to be unique within a snapshot" | Written as NULL | Written as the `data_file_id` |
+| Partial files | `partial_max` described; the per-row columns are not | `_ducklake_internal_snapshot_id` (field 2147483539) and `_ducklake_internal_row_id` (2147483540) in data and delete files | Read both; rows and deletions after the scanned snapshot are ignored |
+| Inlined data and deletions | Data inlining page (not the specification) | `ducklake_inlined_data_{table}_{schema_version}` and `ducklake_inlined_delete_{table}` (the latter not listed in any catalog table); nested values as DuckDB's text cast | Read both, nested values included; never written (inlining is optional) |
+| Nested inlined values | Not specified | Text casts such as `{'c': {'x': CAST('2024-01-02' AS DATE)}}`, which DuckDB 1.5.5 itself fails to read back for dates inside structs | Parsed against the column type, `CAST('…' AS T)` included |
+| Inlined deletions vs delete files | Not specified | A row deleted from a file while its deletions are inlined is recorded in `ducklake_inlined_delete_{table}`, not in the file's delete file; the two are combined on read | A replacement delete file holds the previous delete file's positions plus the new ones, never the inlined deletions (merging them made DuckDB count the rows twice) |
+| `changes_made` kinds | 11 kinds | Also `inlined_insert`, `inlined_delete`, `inline_flush` | Treated as insert, delete and compaction for conflict checks; unknown kinds conflict only with tables this transaction touches |
+| Statistics encodings | `boolean` as `0`/`1`, `blob` as hex | Inlined rows' table statistics hold `true`, `nan`, `\x00\xFF` | Write the spec's encodings (no bounds for blobs); parse all of these, and treat anything unparseable as "no bound" |
+
+## What is not implemented
+
+Views, macros, tags and comments, sort orders, encryption, name-mapped files (`ducklake_add_data_files` without
+field IDs), `variant` and `geometry`, unsigned/128-bit integers, `interval`, `timetz`, second/millisecond timestamps,
+the experimental Puffin deletion vectors, writing inlined data, catalog migration (1.0 → 1.1 is DuckDB's), and
+maintenance (snapshot expiry, file cleanup, compaction). Each fails with `NotSupportedException` when met in a catalog
+or file rather than reading wrong values. The same list is in `tools/spec_trace.py` (`NOT_IMPLEMENTED`).
+
+Within a transaction, a delete must be the first data operation on its table, and a table created in the transaction
+cannot be altered in it (define its columns at creation).
+
+## Tests
+
+| Suite | Needs | Command |
+|---|---|---|
+| `Iceberg.Net.DuckLake.Tests`: `EncodingTests`, `ConflictRuleTests`, `CatalogTests`, `FormatVersionTests`, `ValidatorTests`, `ModelBasedTests` | nothing (PostgreSQL variants skip without a server) | `dotnet test tests/Iceberg.Net.DuckLake.Tests --filter "FullyQualifiedName!~CrossEngine"` |
+| `CrossEngineTests` | a Python with the interop `duckdb` group (1.0); DuckDB 2.0 (1.1) | `ICEBERG_DUCKDB_PYTHON=<python> dotnet test tests/Iceberg.Net.DuckLake.Tests` |
+| `Iceberg.Net.DuckLake.Behaviour.Tests` (BDD) | as above for the DuckDB scenarios (`CrossEngine.feature` and the 1.1 ones in `FormatVersions.feature`) | `ICEBERG_DUCKDB_PYTHON=<python> dotnet test tests/Iceberg.Net.DuckLake.Behaviour.Tests` |
+
+Every catalog-facing test class runs per database and format version (`SqliteCatalogTests10`, `PostgresCatalogTests11`,
+…); `TestLake` (in `Iceberg.Net.DuckLake.TestSupport`) gives each test its own SQLite file or PostgreSQL database,
+dropped afterwards, and validates the lake when the test ends. Environment:
+
+| Variable | Meaning |
+|---|---|
+| `ICEBERG_DUCKLAKE_POSTGRES` | Npgsql connection string of a server the tests may create databases on (`emulation/up.sh` starts one on port 5434) |
+| `ICEBERG_DUCKLAKE_POSTGRES_REQUIRED=1` | Fail instead of skipping when it is unset or unreachable (CI) |
+| `ICEBERG_DUCKDB_PYTHON` / `ICEBERG_DUCKDB_REQUIRED=1` | The 1.0 oracle: a Python with the interop `duckdb` group |
+| `ICEBERG_DUCKLAKE11_PYTHON` / `ICEBERG_DUCKLAKE11_REQUIRED=1` | The 1.1 oracle: a Python with `duckdb==2.0.0` (downloads the extension) |
+| `ICEBERG_PBT_RUNS` / `ICEBERG_PBT_SEED` | Model-based test: number of cases, and a replay seed printed by a failure |
+
+In CI (both databases, both oracles): all 256 tests and all 76 BDD scenarios pass, none skipped. Locally without
+the 1.1 oracle: 234 and 70 pass, the 22 and 6 DuckDB 2.0 cases skip. The projects are in the `cross-engine` CI suite, which starts the emulation stack's
+PostgreSQL, installs both oracles and requires all three. The oracle is `interop/ducklake_oracle.py`: it attaches the
+test's catalog (SQLite or PostgreSQL) in DuckDB and runs SQL against it.
+
+Shared pieces changed for this: `SpecAttribute` accepts the `ducklake:` prefix; `tools/spec_trace.py` pins and
+checks the DuckLake spec (`snapshot --ducklake`, `drift --ducklake`, a DuckLake line in the matrix);
+`tests/Iceberg.Net.Fuzz` and `tools/fuzz.sh` gained two targets; the interop `duckdb` dependency group gained the
+extension wheels (including `postgres_scanner`) and `pytz` (DuckDB's client needs it for `timestamptz` values); the emulation stack gained a PostgreSQL.
+
+## Next steps
+
+1. Typed rows through the LINQ layer's mapping, shared with the Iceberg tables.
+2. Maintenance: `expire_snapshots` and file cleanup through `ducklake_files_scheduled_for_deletion`, and compaction.
+3. Writing inlined data for small inserts (DuckDB's default), and Puffin deletion vectors.
+4. Return the footer size from `ParquetFiles.WriteAsync`, and write `INT(8)`/`INT(16)` annotations, in Iceberg.Net.Data.
+5. An API review, then a named consumer, before graduation.
+
