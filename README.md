@@ -5,15 +5,16 @@
 **Status:** capability review before `0.0.1` — exploratory, **not for production writes yet**.
 
 The [capability baseline](docs/capability-baseline.md) inventories implemented APIs, verification evidence,
-limitations and proposed release criteria. The `0.0.1` scope is still being formalised.
+limitations and proposed release criteria. The [full-stack support proposal](docs/support-contract.md) defines
+the intended package, server, resource and platform boundaries. The `0.0.1` scope is still being formalised.
 
 ## Why this exists
 
 Writing to Iceberg tables from C# today means handing the write to Python, Spark or a SQL engine. This
 project is **a native .NET Iceberg library**, so a C# producer can commit to a table
-directly through Glue (or any REST catalog) with the same guarantees PyIceberg and Java give.
+directly through Glue or compatible REST catalogs using Iceberg's optimistic commit protocol.
 
-No production-grade .NET Iceberg library exists today (see [docs/ports-and-engines.md](docs/ports-and-engines.md)).
+Implementation comparisons and reference engines are recorded in [docs/ports-and-engines.md](docs/ports-and-engines.md).
 
 ## What works now
 
@@ -78,7 +79,7 @@ Iceberg.NET/
 
 ```bash
 # Run from the repository root
-./run-tests.sh spec        # L0 only: ~1 s, no network
+./run-tests.sh spec        # unit suites, no network or Docker
 ./run-tests.sh emulation   # starts moto + REST fixture, runs everything that doesn't need AWS
 ICEBERG_WAREHOUSE=s3://my-bucket/iceberg-regression ICEBERG_ATHENA_WORKGROUP=primary \
   ./run-tests.sh aws       # real Glue, S3 and Athena (see docs/regression-suite.md first)
